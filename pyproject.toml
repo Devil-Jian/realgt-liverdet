@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "realgt-liverdet"
+version = "0.1.0"
+description = "Patient-disjoint real manual-GT AP/PVP liver-lesion detection"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3", "pandas>=2.0", "nibabel>=5.1", "scipy>=1.10",
+    "Pillow>=10", "pyyaml>=6", "pycocotools>=2.0.7",
+]
+
+[project.optional-dependencies]
+train = ["ultralytics>=8.2"]
+test = ["pytest>=8"]
+
+[project.scripts]
+realgt = "realgt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
