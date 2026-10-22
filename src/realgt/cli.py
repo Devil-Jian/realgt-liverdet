@@ -25,6 +25,9 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--val-fraction", type=float, default=.15)
     b.add_argument("--hu-min", type=float, default=HU_MIN)
     b.add_argument("--hu-max", type=float, default=HU_MAX)
+    e = sub.add_parser("export", help="Resume COCO/YOLO exports from existing manifests/slices.csv; no NIfTI reprocessing")
+    e.add_argument("--out", required=True, help="Existing realgt build output root")
+    e.add_argument("--slices", help="Override slices.csv path (defaults to <out>/manifests/slices.csv)")
     t = sub.add_parser("train", help="100 Epoch max, Val each epoch, automatic one-time Test")
     t.add_argument("--dataset", required=True)
     t.add_argument("--out", required=True)
@@ -58,6 +61,22 @@ def main(argv=None):
         for phase in ("ap", "pvp"):
             export_phase(frames, out, phase)
         print("Done: REAL manual ground truth datasets (AP and PVP), no pseudo masks.")
+    elif a.action == "export":
+        out = Path(a.out).resolve()
+        slices_path = Path(a.slices) if a.slices else out / "manifests" / "slices.csv"
+        if not slices_path.is_file():
+            raise FileNotFoundError(f"Prepared manifest missing: {slices_path}; run realgt build first")
+        frame = pd.read_csv(slices_path, dtype={"patient_id": str, "sample_id": str},
+                            keep_default_na=False)
+        required = {"patient_id", "phase", "split", "sample_id", "real_path",
+                    "boxes", "label_source", "is_positive"}
+        if missing := required - set(frame.columns):
+            raise ValueError(f"Invalid prepared manifest; missing columns: {sorted(missing)}")
+        if not (out / "manifests" / "preprocess.json").is_file():
+            raise FileNotFoundError("Missing preprocess.json; refuses export from unverified source")
+        for phase in ("ap", "pvp"):
+            export_phase(frame, out, phase)
+        print("Export recovered from prepared slices.csv without rerunning NIfTI conversion.")
     elif a.action == "train":
         from .train import run_yolo
         run_yolo(a.dataset, a.out, epochs=a.epochs, batch=a.batch, imgsz=a.imgsz,

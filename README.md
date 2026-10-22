@@ -104,6 +104,22 @@ realgt build \
 
 导出文件通过软链接引用单份PNG，减少磁盘重复占用。`counts.csv` 给出每期每组患者、切片、阳性/阴性及BBox数量。
 
+
+### 3.1 `PermissionError: Operation not permitted` during image export
+
+如果构建已经输出了 `Slice count: ...`，随后因 `dest.symlink_to(src)` 报 `PermissionError`，说明所有NIfTI切片处理和 `manifests/slices.csv` 已经完成，**不要删除工作目录或重新运行 `realgt build`**。此时更新项目代码并从现有清单单独恢复导出即可：
+
+```bash
+cd /workspace/realgt-liverdet
+git pull origin main
+python -m pip install -e .
+realgt export --out /dataset/realgt_liverdet
+```
+
+`realgt export` 不再处理NIfTI或重做患者划分，仅从已完成的 `manifests/slices.csv` 生成COCO/YOLO导出。PNG优先采用软链接、受限文件系统上尝试硬链接，均不支持时用 `copy2` 拷贝，已有PNG自动复用。若采用复制，磁盘占用会比软链接方案增加，应先检查 `df -h /dataset`。
+
+**重要：** 导出只复用当前 `slices.csv` 中的Train/Val/Test分配，**不会替你重新应用固定27例Val名单**。如果原 `--out` 并非固定Val构建输出，先检查 `manifests/splits.csv` 与 `manifests/fixed_val_audit.csv`。若划分不正确，使用新的工作目录和 `--fixed-val-patients` 正式重建，不要用随机划分结果进行后续模型选择。
+
 ## 4. 训练前必须检查BBox可视化
 
 ```bash

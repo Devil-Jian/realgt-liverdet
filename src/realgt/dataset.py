@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -274,11 +276,48 @@ def prepare(cases: pd.DataFrame, splits: pd.DataFrame, out: Path, *,
     return frame
 
 
+def _materialize_png(src: Path, dest: Path) -> str:
+    """Export an image without requiring symlink permissions on /dataset.
+
+    Prefer a zero-copy symlink, then a same-filesystem hardlink, and finally
+    copy2 on restricted/mounted filesystems. A retry reuses existing files.
+    """
+    if dest.is_symlink() and not dest.exists():
+        dest.unlink()  # Broken link from an interrupted older export.
+    if dest.is_file():
+        if dest.stat().st_size != src.stat().st_size:
+            raise ValueError(f"Existing export image differs from source: {dest}")
+        return "existing"
+    if dest.exists():
+        raise ValueError(f"Image export destination is not a file: {dest}")
+    for operation in (lambda: dest.symlink_to(src),
+                      lambda: os.link(src, dest)):
+        try:
+            operation()
+            return "linked"
+        except OSError:
+            # Some containers forbid symlinks or hardlinks on /dataset.
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+    try:
+        shutil.copy2(src, dest)
+    except Exception:
+        if dest.is_file():
+            dest.unlink()
+        raise
+    return "copied"
+
+
 def export_phase(frame: pd.DataFrame, out: Path, phase: str) -> Path:
     if phase not in PHASES:
         raise ValueError(phase)
+    if not frame.label_source.eq("manual").all():
+        raise ValueError("Manual-GT project refuses non-manual labels in exports")
+    if (frame.groupby("patient_id").split.nunique() > 1).any():
+        raise ValueError("Patient split leakage in slices manifest")
     base = Path(out).resolve() / "exports" / f"real_gt_{phase}"
     counts = []
+    materialized = {"linked": 0, "copied": 0, "existing": 0}
     for split in SPLITS:
         sub = frame[frame.phase.eq(phase) & frame.split.eq(split)]
         annotations, images = [], []
@@ -290,8 +329,7 @@ def export_phase(frame: pd.DataFrame, out: Path, phase: str) -> Path:
             dest = im_dir / src.name
             if not src.is_file():
                 raise FileNotFoundError(src)
-            if not dest.exists():
-                dest.symlink_to(src)
+            materialized[_materialize_png(src, dest)] += 1
             with Image.open(src) as im:
                 w, h = im.size
             images.append({"id": image_id, "file_name": dest.name, "width": w, "height": h,
@@ -326,7 +364,10 @@ def export_phase(frame: pd.DataFrame, out: Path, phase: str) -> Path:
     all_counts = pd.DataFrame(counts)
     if (all_counts.images == 0).any() or (all_counts.boxes == 0).any():
         raise ValueError(f"Each split needs slices and annotated lesions, see {base}/counts.csv")
-    print(f"Exported {base}:\n{all_counts.to_string(index=False)}", flush=True)
+    print(f"Exported {base}:\n{all_counts.to_string(index=False)}\n"
+          f"Images: {materialized['linked']} linked, "
+          f"{materialized['copied']} copied, "
+          f"{materialized['existing']} reused.", flush=True)
     return base
 
 
