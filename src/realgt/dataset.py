@@ -28,14 +28,18 @@ def _csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False)
 
 
-def scan_cases(root: str, dest: Path) -> pd.DataFrame:
-    """Require complete manual tumor masks for both phases for each included patient."""
+def scan_cases(root: str, dest: Path, *, allowed_patients: Optional[str] = None) -> pd.DataFrame:
+    """Require paired manual masks, and optionally enforce an explicit allowed cohort."""
     source = Path(root).resolve()
     if not source.is_dir():
         raise NotADirectoryError(source)
+    allowed = set(_read_fixed_val_list(allowed_patients)) if allowed_patients else None
     records = []
     incomplete = []
+    cohort_status = {}
     for folder in sorted(p for p in source.iterdir() if p.is_dir()):
+        if allowed is not None and folder.name not in allowed:
+            continue
         paths = {
             p: (folder / f"{p}_registered.nii.gz",
                 folder / f"{p}_tumor_mask_registered.nii.gz")
@@ -43,10 +47,16 @@ def scan_cases(root: str, dest: Path) -> pd.DataFrame:
         }
         labeled = [p for p, (_, label) in paths.items() if label.is_file()]
         if not labeled:
-            continue  # All non-manual cases are excluded, even if pseudo masks exist.
+            if allowed is not None:
+                cohort_status[folder.name] = "missing_manual_tumor_masks"
+            continue  # Non-manual cases are excluded, even if pseudo masks exist.
         if len(labeled) != len(PHASES) or any(not im.is_file() for im, _ in paths.values()):
             incomplete.append(folder.name)
+            if allowed is not None:
+                cohort_status[folder.name] = "incomplete_ap_pvp_manual_gt_or_images"
             continue
+        if allowed is not None:
+            cohort_status[folder.name] = "eligible_manual_gt"
         for phase, (image_path, mask_path) in paths.items():
             records.append({
                 "patient_id": folder.name, "phase": phase,
@@ -62,6 +72,16 @@ def scan_cases(root: str, dest: Path) -> pd.DataFrame:
                       columns=["patient_id", "reason"]), excluded_path)
     if incomplete:
         print(f"Excluded {len(incomplete)} incomplete real-GT patients; audit: {excluded_path}", flush=True)
+    if allowed is not None:
+        audit = pd.DataFrame([
+            {"patient_id": pid, "status": cohort_status.get(pid, "missing_patient_directory")}
+            for pid in sorted(allowed)
+        ])
+        _csv(audit, dest.parent / "all_cohort_audit.csv")
+        print(f"Allowed real-GT cohort={len(allowed)}; "
+              f"eligible={int((audit.status == 'eligible_manual_gt').sum())}; "
+              f"ineligible={int((audit.status != 'eligible_manual_gt').sum())}; "
+              f"audit={dest.parent / 'all_cohort_audit.csv'}", flush=True)
     if not records:
         raise ValueError(f"No *tumor_mask_registered.nii.gz manual AP/PVP pairs found under {source}")
     df = pd.DataFrame(records)
@@ -98,18 +118,80 @@ def _read_fixed_val_list(filename: str) -> list[str]:
 def build_splits(cases: pd.DataFrame, dest: Path, *, seed: int = 42,
                  train_fraction: float = .70, val_fraction: float = .15,
                  external_csv: Optional[str] = None,
-                 fixed_val_patients: Optional[str] = None) -> pd.DataFrame:
+                 fixed_val_patients: Optional[str] = None,
+                 priority_train_patients: Optional[str] = None) -> pd.DataFrame:
     patients = sorted(cases.patient_id.astype(str).unique().tolist())
     n = len(patients)
     if n < 3:
         raise ValueError("At least 3 manually labeled patients needed for Train/Val/Test")
-    if fixed_val_patients and external_csv:
-        raise ValueError("Cannot combine --fixed-val-patients with --splits-file: "
-                         "a fully specified external split overrides auto-allocation")
+    if (fixed_val_patients or priority_train_patients) and external_csv:
+        raise ValueError("Cannot combine --splits-file with fixed Val or priority Train lists: "
+                         "external splits must be fully specified")
     if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and
             train_fraction + val_fraction < 1):
         raise ValueError("Invalid train/val fractions")
-    if external_csv:
+    if priority_train_patients:
+        requested_train = _read_fixed_val_list(priority_train_patients)
+        train_set = set(requested_train)
+        requested_val = _read_fixed_val_list(fixed_val_patients) if fixed_val_patients else []
+        if train_set & set(requested_val):
+            raise ValueError("Patient appears in both priority Train and fixed Val lists: " +
+                             ", ".join(sorted(train_set & set(requested_val))[:10]))
+        eligible = set(patients)
+        train_ids = train_set & eligible
+        val_ids = set(requested_val) & eligible
+        rng = np.random.default_rng(seed)
+        available = np.array(sorted(eligible - train_ids - val_ids), dtype=str)
+        rng.shuffle(available)
+        # When a fixed Val list is provided, fill invalid entries with
+        # other manual-GT patients, but NEVER take candidates from Train.
+        desired_val = (len(requested_val) if fixed_val_patients else
+                       max(1, round(n * val_fraction)))
+        n_fill = max(0, desired_val - len(val_ids))
+        if len(available) < n_fill + 1 or not train_ids:
+            raise ValueError(
+                f"Insufficient eligible cases for priority Train ({len(train_ids)}), "
+                f"target Val ({desired_val}) and nonempty Test. "
+                "Check all_cohort_audit.csv and manual GT coverage."
+            )
+        added_val = [str(p) for p in available[:n_fill]]
+        val_ids.update(added_val)
+        test_ids = set(str(p) for p in available[n_fill:])
+        if not val_ids or not test_ids:
+            raise ValueError("Train/Val/Test must all be nonempty")
+        split = pd.DataFrame({
+            "patient_id": patients,
+            "split": ["train" if pid in train_ids else
+                      "val" if pid in val_ids else "test" for pid in patients],
+            "split_source": [
+                "priority_train" if pid in train_ids else
+                "fixed_val" if pid in set(requested_val) else
+                "val_replacement" if pid in added_val else
+                "remaining_test" for pid in patients
+            ]
+        })
+        status_rows = (
+            [{"patient_id": pid, "requested": "train",
+              "status": "priority_train_included" if pid in eligible else "priority_train_ineligible"}
+             for pid in requested_train] +
+            [{"patient_id": pid, "requested": "val",
+              "status": "fixed_val_included" if pid in eligible else "fixed_val_ineligible"}
+             for pid in requested_val] +
+            [{"patient_id": pid, "requested": "val_replacement", "status": "val_replacement"}
+             for pid in added_val]
+        )
+        _csv(pd.DataFrame(status_rows, columns=["patient_id", "requested", "status"]),
+             dest.parent / "priority_split_audit.csv")
+        if (missing_train := train_set - eligible):
+            print("WARNING: priority Train IDs without complete manual GT: "
+                  + ", ".join(sorted(missing_train)), flush=True)
+        if (missing_val := set(requested_val) - eligible):
+            print("WARNING: fixed Val IDs without complete manual GT: "
+                  + ", ".join(sorted(missing_val)), flush=True)
+        print(f"Priority splitting: train={len(train_ids)}, val={len(val_ids)} "
+              f"(replacement={len(added_val)}), test={len(test_ids)}. "
+              "No priority Train patient moved to Val/Test.", flush=True)
+    elif external_csv:
         sf = pd.read_csv(external_csv, dtype={"patient_id": str}, keep_default_na=False)
         if not {"patient_id", "split"}.issubset(sf.columns):
             raise ValueError("External splits CSV requires patient_id,split")
