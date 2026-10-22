@@ -16,7 +16,10 @@ def parser() -> argparse.ArgumentParser:
     b = sub.add_parser("build", help="Scan manual masks -> patient splits -> PNG/COCO/YOLO")
     b.add_argument("--root", default="/dataset/dataset/gx_all_registered")
     b.add_argument("--out", default="/dataset/realgt_liverdet")
-    b.add_argument("--splits-file", help="Optional fixed patient_id,split CSV; prevents changing held-out Test")
+    b.add_argument("--splits-file", help="Optional complete patient_id,split CSV. Cannot combine with --fixed-val-patients.")
+    b.add_argument("--fixed-val-patients",
+                   help="Private TXT/CSV with one patient_id per line; all eligible IDs forced into Val, "
+                        "ineligible IDs replaced by other manually annotated patients.")
     b.add_argument("--seed", type=int, default=42)
     b.add_argument("--train-fraction", type=float, default=.70)
     b.add_argument("--val-fraction", type=float, default=.15)
@@ -49,7 +52,8 @@ def main(argv=None):
         cases = scan_cases(a.root, out / "manifests" / "cases.csv")
         splits = build_splits(cases, out / "manifests" / "splits.csv", seed=a.seed,
                               train_fraction=a.train_fraction, val_fraction=a.val_fraction,
-                              external_csv=a.splits_file)
+                              external_csv=a.splits_file,
+                              fixed_val_patients=a.fixed_val_patients)
         frames = prepare(cases, splits, out, hu_min=a.hu_min, hu_max=a.hu_max)
         for phase in ("ap", "pvp"):
             export_phase(frames, out, phase)
