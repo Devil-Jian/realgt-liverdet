@@ -377,3 +377,25 @@ def test_build_cli_private_all_priority_train_fixed_val(tmp_path):
     )
     assert (out / "manifests" / "all_cohort_audit.csv").exists()
     assert (out / "manifests" / "priority_split_audit.csv").exists()
+
+
+def test_cohort_plan_only_no_volume_processing(tmp_path, monkeypatch):
+    root = _dataset(tmp_path, n=9)
+    def write_ids(name, values):
+        p = tmp_path / name
+        p.write_text("\n".join(values) + "\n")
+        return str(p)
+    all_path = write_ids("all.txt", [f"P{i:03d}" for i in range(9)])
+    train_path = write_ids("train.txt", [f"P{i:03d}" for i in range(4)])
+    val_path = write_ids("val.txt", ["P004", "P005"])
+    monkeypatch.setattr("realgt.dataset.nib.load",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("NIfTI should not be read")))
+    dest = tmp_path / "plan"
+    main(["plan", "--root", str(root), "--out", str(dest),
+          "--all-patients", all_path, "--priority-train-patients", train_path,
+          "--fixed-val-patients", val_path])
+    assert (dest / "manifests" / "splits.csv").is_file()
+    assert not (dest / "manifests" / "slices.csv").exists()
+    assert not (dest / "data").exists()
+    splits = pd.read_csv(dest / "manifests" / "splits.csv")
+    assert splits.split.value_counts().to_dict() == {"train": 4, "val": 2, "test": 3}
