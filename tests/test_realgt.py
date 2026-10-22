@@ -214,3 +214,52 @@ def test_cli_uses_epochs_not_steps():
     assert (args.epochs, args.batch, args.imgsz, args.patience) == (100, 32, 640, 15)
     with pytest.raises(SystemExit):
         parser().parse_args(["train", "--dataset", "d", "--out", "o", "--steps", "2000"])
+
+
+def test_export_fallback_to_copy_without_symlink_or_hardlink(tmp_path, monkeypatch):
+    """Simulates container/bind mount EPERM on both link variants."""
+    import os
+    import shutil
+
+    from realgt.dataset import _materialize_png
+    source = tmp_path / "source.png"
+    dest = tmp_path / "dest.png"
+    Image.new("L", (16, 16), 73).save(source)
+
+    def blocked(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(Path, "symlink_to", blocked)
+    monkeypatch.setattr(os, "link", blocked)
+    assert _materialize_png(source, dest) == "copied"
+    assert dest.read_bytes() == source.read_bytes()
+    # Re-running after a partially completed export must be idempotent.
+    assert _materialize_png(source, dest) == "existing"
+
+
+def test_cli_export_resume_does_not_reload_nifti(tmp_path, monkeypatch):
+    import os
+    import shutil
+
+    root = _dataset(tmp_path)
+    out = tmp_path / "out"
+    main(["build", "--root", str(root), "--out", str(out)])
+    shutil.rmtree(out / "exports")
+
+    def blocked(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    # Export-only must use slices.csv and not reprocess expensive NIfTI.
+    monkeypatch.setattr("realgt.dataset.nib.load",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("read NIfTI")))
+    monkeypatch.setattr(Path, "symlink_to", blocked)
+    monkeypatch.setattr(os, "link", blocked)
+    main(["export", "--out", str(out)])
+    for phase in ("ap", "pvp"):
+        base = out / "exports" / f"real_gt_{phase}"
+        counts = pd.read_csv(base / "counts.csv")
+        assert counts.images.sum() == 6 * 3
+        assert counts.boxes.sum() == 6
+        assert len(list((base / "images" / "train").glob("*.png"))) > 0
+    # Repeated export reuses copies without failure.
+    main(["export", "--out", str(out)])
