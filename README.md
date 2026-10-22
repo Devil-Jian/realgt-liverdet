@@ -13,7 +13,7 @@ pvp_registered.nii.gz
 pvp_tumor_mask_registered.nii.gz     # 人工肿瘤Mask
 ```
 
-- 必须AP/PVP两期配对，且影像和Mask的shape+affine一致。没有人工肿瘤Mask的患者全部排除，只有一期标注的患者会导致明确报错，避免静默遗漏。
+- 必须AP/PVP两期配对，且影像和Mask的shape+affine一致。没有人工肿瘤Mask的患者全部排除，只有一期人工标注的患者会被排除并写入 `manifests/excluded_incomplete_manual_cases.csv` 明确审计，不会作为阴性或伪标签样本。
 - 人工GT中所有前景 `>0` 视为肿瘤。逐层使用8连通域计算BBox；**1像素肿瘤也保留**。
 - 人工Mask空层作为真正阴性使用，前提是人工Mask为全体积完整标注；若实际只标注了某个局部范围，**不能把范围外空层视为阴性**，需要先完善标注覆盖范围/另行修改采样策略。
 - 此项目无任何伪标签回退。没有真实肿瘤Mask不能进入任何数据组。
@@ -44,7 +44,31 @@ realgt build \
   --val-fraction 0.15
 ```
 
-如果正好108例符合要求，四舍五入后默认约 **76例Train、16例Val、16例Test**；实际数量以扫描结果为准。`manifests/splits.csv` 会保存明确划分，完全无患者交叉。
+不指定固定Val名单时，如果正好108例符合要求，默认约 **76例Train、16例Val、16例Test**；实际数量以扫描结果为准。`manifests/splits.csv` 会保存明确划分，完全无患者交叉。
+
+### 指定优先固定Val患者（推荐）
+
+**不要将患者ID名单上传到公开GitHub仓库。** 在服务器本地创建一个私人文本文件（每行一个`patient_id`，无表头），如 `/dataset/private_cohorts/fixed_val_patients.txt`，将需要固定在Val中的患者写入。构建时使用：
+
+```bash
+realgt build \
+  --root /dataset/dataset/gx_all_registered \
+  --out /dataset/realgt_liverdet_fixed_val \
+  --fixed-val-patients /dataset/private_cohorts/fixed_val_patients.txt \
+  --seed 42 \
+  --train-fraction 0.70 \
+  --val-fraction 0.15
+```
+
+- 所有**符合完整AP/PVP人工肿瘤GT条件的指定患者**均固定分入Val，不参与Train/Test。
+- 若指定27人但只有24人符合真实GT条件，其余3人会由其他完整真实GT患者**自动补足**，最终Val不少于27例。有效指定患者不足时不会混入伪标签，也不会把缺失GT患者作为阴性。
+- Val目标为 `max(名单行数, round(有效患者数 × val_fraction))`，Test数量仍尽量保持 `round(有效患者数 × (1 - train_fraction - val_fraction))`，剩余给Train。例：**108例符合真实GT，固定名单27人 → 65 Train / 27 Val / 16 Test**。这时实际Train约60%，不能同时维持70%比例。
+- 若真实标注患者不足以同时保证Val、Test和Train都有病例，程序会**明确报错，不会偷偷减少Val或Test**。
+- `manifests/fixed_val_audit.csv` 记录 `requested_val_included`、`requested_val_ineligible`、`val_replacement`；`manifests/excluded_incomplete_manual_cases.csv` 记录缺失一期人工GT/影像而被排除者。**这两份文件保留在私有服务器上，不要上传公开仓库。**
+- `manifests/splits.csv` 多出 `split_source` 追踪各患者为何分入该集合。不能同时使用 `--fixed-val-patients` 和 `--splits-file`；后者适用于你已手动固定Train/Val/Test全部名单的情形。
+- 为避免复用旧PNG和旧split，**固定名单新实验请使用新的 `--out` 目录**。
+
+**注意：** 真实GT要求每张纳入的CT层面已经完整标注，所有空Mask才可视为阴性。
 
 **重要：** 旧项目中108例人工GT先前被当作Val/Test。若重新划分训练，与旧项目原Test结果不再具有相同测试集，不能直接比较；已经看过的旧Test指标也会影响模型选择的独立性。如果想**保留旧Test 54例**，请提供覆盖所有GT患者的固定 `patient_id,split` CSV，然后用：
 

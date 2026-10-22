@@ -51,9 +51,15 @@ def scan_cases(root: str, dest: Path) -> pd.DataFrame:
                 "image_path": str(image_path.resolve()),
                 "mask_path": str(mask_path.resolve()), "label_source": "manual",
             })
+    # Incomplete real-GT patients cannot enter any split. Record exclusions
+    # explicitly, rather than allowing one incomplete patient to block all
+    # other eligible cases or treating its missing mask as a true negative.
+    excluded_path = dest.parent / "excluded_incomplete_manual_cases.csv"
+    _csv(pd.DataFrame({"patient_id": incomplete,
+                       "reason": ["incomplete AP/PVP manual tumor masks or images"] * len(incomplete)},
+                      columns=["patient_id", "reason"]), excluded_path)
     if incomplete:
-        raise ValueError("Incomplete AP/PVP manual cases (not silently skipped): " +
-                         ", ".join(incomplete[:20]) + f"; total={len(incomplete)}")
+        print(f"Excluded {len(incomplete)} incomplete real-GT patients; audit: {excluded_path}", flush=True)
     if not records:
         raise ValueError(f"No *tumor_mask_registered.nii.gz manual AP/PVP pairs found under {source}")
     df = pd.DataFrame(records)
@@ -64,13 +70,43 @@ def scan_cases(root: str, dest: Path) -> pd.DataFrame:
     return df
 
 
+def _read_fixed_val_list(filename: str) -> list[str]:
+    """Read private text or CSV file: one exact patient_id per line."""
+    path = Path(filename)
+    if not path.is_file():
+        raise FileNotFoundError(f"Fixed Val list not found: {path}")
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+        if "patient_id" not in df.columns:
+            raise ValueError("Fixed Val CSV must contain a patient_id column")
+        values = df["patient_id"].tolist()
+    else:
+        values = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines()
+                  if line.strip() and not line.lstrip().startswith("#")]
+        if values and values[0] == "patient_id":
+            values = values[1:]
+    values = [str(v).strip() for v in values]
+    if not values or any(not value for value in values):
+        raise ValueError("Fixed Val patient list is empty or has blank IDs")
+    if len(values) != len(set(values)):
+        raise ValueError("Duplicate patient IDs in fixed Val patient list")
+    return values
+
+
 def build_splits(cases: pd.DataFrame, dest: Path, *, seed: int = 42,
                  train_fraction: float = .70, val_fraction: float = .15,
-                 external_csv: Optional[str] = None) -> pd.DataFrame:
+                 external_csv: Optional[str] = None,
+                 fixed_val_patients: Optional[str] = None) -> pd.DataFrame:
     patients = sorted(cases.patient_id.astype(str).unique().tolist())
     n = len(patients)
     if n < 3:
         raise ValueError("At least 3 manually labeled patients needed for Train/Val/Test")
+    if fixed_val_patients and external_csv:
+        raise ValueError("Cannot combine --fixed-val-patients with --splits-file: "
+                         "a fully specified external split overrides auto-allocation")
+    if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and
+            train_fraction + val_fraction < 1):
+        raise ValueError("Invalid train/val fractions")
     if external_csv:
         sf = pd.read_csv(external_csv, dtype={"patient_id": str}, keep_default_na=False)
         if not {"patient_id", "split"}.issubset(sf.columns):
@@ -81,20 +117,68 @@ def build_splits(cases: pd.DataFrame, dest: Path, *, seed: int = 42,
             raise ValueError("Unknown split; use train/val/test")
         split = sf[["patient_id", "split"]].sort_values("patient_id").reset_index(drop=True)
     else:
-        if not (0 < train_fraction < 1 and 0 < val_fraction < 1 and
-                train_fraction + val_fraction < 1):
-            raise ValueError("Invalid split fractions")
         rng = np.random.default_rng(seed)
         shuffled = np.array(patients, dtype=str)
         rng.shuffle(shuffled)
-        a = round(n * train_fraction)
-        b = round(n * val_fraction)
-        if min(a, b, n - a - b) < 1:
-            raise ValueError("Train, Val and Test must each contain a patient")
-        split = pd.DataFrame({"patient_id": shuffled.tolist(),
-                              "split": ["train"] * a + ["val"] * b +
-                                       ["test"] * (n - a - b)})
-        split = split.sort_values("patient_id").reset_index(drop=True)
+        if fixed_val_patients:
+            requested = _read_fixed_val_list(fixed_val_patients)
+            eligible = set(patients)
+            fixed = set(requested) & eligible
+            missing = [pid for pid in requested if pid not in eligible]
+            # At least as many Val patients as were requested, even if some
+            # named patients have no complete manual-GT AP/PVP pair.
+            target_val = max(len(requested), round(n * val_fraction))
+            # Preserve the requested Test fraction rather than collapsing
+            # Test to a handful of patients when fixed Val exceeds 15%.
+            target_test = max(1, round(n * (1.0 - train_fraction - val_fraction)))
+            if target_val + target_test >= n:
+                raise ValueError(
+                    f"Not enough eligible real-GT patients (n={n}) for "
+                    f"fixed Val target={target_val}, Test target={target_test} "
+                    "and at least one Train patient. Provide more complete GT "
+                    "cases or adjust split fractions."
+                )
+            remainder = [pid for pid in shuffled if pid not in fixed]
+            additional_count = target_val - len(fixed)
+            added = [str(pid) for pid in remainder[:additional_count]]
+            val_ids = fixed | set(added)
+            candidates = [str(pid) for pid in remainder[additional_count:]]
+            test_ids = set(candidates[:target_test])
+            split = pd.DataFrame({
+                "patient_id": patients,
+                "split": ["val" if pid in val_ids else
+                          "test" if pid in test_ids else "train" for pid in patients],
+                "split_source": ["requested_val" if pid in fixed else
+                                 "val_replacement" if pid in added else
+                                 "heldout_test" if pid in test_ids else
+                                 "random_train" for pid in patients],
+            })
+            audit = pd.DataFrame(
+                [{"patient_id": pid, "status": "requested_val_included"
+                  if pid in fixed else "requested_val_ineligible"}
+                 for pid in requested] +
+                [{"patient_id": pid, "status": "val_replacement"} for pid in added],
+                columns=["patient_id", "status"],
+            )
+            audit_path = dest.parent / "fixed_val_audit.csv"
+            _csv(audit, audit_path)
+            print(f"Fixed-Val policy: requested={len(requested)}, "
+                  f"eligible_fixed={len(fixed)}, ineligible={len(missing)}, "
+                  f"replacements={len(added)}, final_val={len(val_ids)}, "
+                  f"test={len(test_ids)}, train={n-len(val_ids)-len(test_ids)}; "
+                  f"audit={audit_path}", flush=True)
+            if missing:
+                print("WARNING: Ineligible requested Val patients (missing complete "
+                      "AP/PVP manual GT): " + ", ".join(missing), flush=True)
+        else:
+            a = round(n * train_fraction)
+            b = round(n * val_fraction)
+            if min(a, b, n - a - b) < 1:
+                raise ValueError("Train, Val and Test must each contain a patient")
+            split = pd.DataFrame({"patient_id": shuffled.tolist(),
+                                  "split": ["train"] * a + ["val"] * b +
+                                           ["test"] * (n - a - b)})
+            split = split.sort_values("patient_id").reset_index(drop=True)
     if set(split.split) != set(SPLITS):
         raise ValueError("All three splits must be nonempty")
     _csv(split, dest)

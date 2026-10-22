@@ -78,12 +78,76 @@ def test_bbox_8_connectivity_keeps_one_pixel():
     assert _bboxes(mask) == [[2, 1, 4, 3], [7, 6, 8, 7]]
 
 
-def test_incomplete_manual_phase_rejected(tmp_path):
-    root = tmp_path / "source"
-    _nii(root / "P001" / "ap_registered.nii.gz", np.zeros((5,5,5)))
-    _nii(root / "P001" / "ap_tumor_mask_registered.nii.gz", np.zeros((5,5,5)))
-    with pytest.raises(ValueError, match="Incomplete"):
-        scan_cases(str(root), tmp_path / "cases.csv")
+def test_incomplete_manual_phase_audited_and_excluded(tmp_path):
+    root = _dataset(tmp_path)
+    _nii(root / "INCOMPLETE" / "ap_registered.nii.gz", np.zeros((5,5,5)))
+    _nii(root / "INCOMPLETE" / "ap_tumor_mask_registered.nii.gz", np.zeros((5,5,5)))
+    cases = scan_cases(str(root), tmp_path / "manifests" / "cases.csv")
+    assert "INCOMPLETE" not in set(cases.patient_id)
+    audit = pd.read_csv(tmp_path / "manifests" / "excluded_incomplete_manual_cases.csv")
+    assert audit.patient_id.tolist() == ["INCOMPLETE"]
+
+
+def test_fixed_val_27_and_manual_gt_replacements(tmp_path):
+    from realgt.dataset import _read_fixed_val_list
+    # Simulate 108 full-GT patients. Three named IDs lack full real-GT
+    # and must be replaced with other eligible manual-GT patients.
+    ids = [f"G{i:03d}" for i in range(108)]
+    cases = pd.DataFrame([
+        {"patient_id": pid, "phase": phase, "label_source": "manual"}
+        for pid in ids for phase in ("ap", "pvp")
+    ])
+    requested = [f"G{i:03d}" for i in range(24)] + [
+        "INELIGIBLE_1", "INELIGIBLE_2", "INELIGIBLE_3"
+    ]
+    private_file = tmp_path / "private_val.txt"
+    private_file.write_text("\n".join(requested) + "\n")
+    assert _read_fixed_val_list(str(private_file)) == requested
+    dest = tmp_path / "manifests" / "splits.csv"
+    splits = build_splits(
+        cases, dest, seed=42, train_fraction=.70, val_fraction=.15,
+        fixed_val_patients=str(private_file)
+    )
+    assert splits.split.value_counts().to_dict() == {
+        "train": 65, "val": 27, "test": 16
+    }
+    assert set(requested[:24]).issubset(
+        set(splits.loc[splits.split == "val", "patient_id"])
+    )
+    assert not (set(requested[:24]) & set(splits.loc[splits.split != "val", "patient_id"]))
+    assert (splits.split_source == "requested_val").sum() == 24
+    assert (splits.split_source == "val_replacement").sum() == 3
+    audit = pd.read_csv(dest.parent / "fixed_val_audit.csv")
+    assert (audit.status == "requested_val_ineligible").sum() == 3
+    assert (audit.status == "val_replacement").sum() == 3
+    assert all(splits.groupby("patient_id").split.nunique() == 1)
+    again = build_splits(cases, dest.parent / "repeat.csv", seed=42,
+                         train_fraction=.70, val_fraction=.15,
+                         fixed_val_patients=str(private_file))
+    pd.testing.assert_frame_equal(splits, again)
+
+
+def test_fixed_val_insufficient_eligible_patients_raises(tmp_path):
+    cases = pd.DataFrame([
+        {"patient_id": f"P{i}", "phase": phase, "label_source": "manual"}
+        for i in range(10) for phase in ("ap", "pvp")
+    ])
+    val = tmp_path / "fixed_val.csv"
+    pd.DataFrame({"patient_id": [f"A{i}" for i in range(9)]}).to_csv(val, index=False)
+    with pytest.raises(ValueError, match="Not enough eligible"):
+        build_splits(cases, tmp_path / "splits.csv", fixed_val_patients=str(val))
+
+
+def test_fixed_val_and_full_external_splits_conflict(tmp_path):
+    cases = pd.DataFrame([
+        {"patient_id": f"P{i}", "phase": phase, "label_source": "manual"}
+        for i in range(6) for phase in ("ap", "pvp")
+    ])
+    val = tmp_path / "fixed.txt"
+    val.write_text("P0\n")
+    with pytest.raises(ValueError, match="Cannot combine"):
+        build_splits(cases, tmp_path / "splits.csv",
+                     fixed_val_patients=str(val), external_csv="unused.csv")
 
 
 def test_external_splits_preserve_test(tmp_path):
