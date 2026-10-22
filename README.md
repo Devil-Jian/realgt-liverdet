@@ -2,6 +2,48 @@
 
 本项目**只使用人工肿瘤真值**训练和评价 YOLOv8s，不接受教师伪标签、不读取旧项目的 `train_slices.json`，不使用肝脏Mask裁剪，不删除小病灶。AP/PVP分开训练；所有切片输出完整512×512 CT（具体像素尺寸与NIfTI一致），HU默认窗口 `[-160,240]`。所有 **Train/Val/Test 均保留经过完整人工标注的阳性与阴性切片**。Test仅在训练达到100 Epoch或早停之后，使用Val最佳权重做一次最终评价。
 
+## 优先Train + 全部真实肿瘤标签患者名单（推荐新规则）
+
+当前支持从服务器本地的两份私有名单控制队列，而不是再按70/15/15随机拆分。
+
+- `--all-patients /dataset/private_cohorts/all.txt`：**允许纳入的全部人工GT患者ID名单**。文件不在名单中的患者不会进入任何集合。名单中的病例如果缺少完整的AP和PVP人工肿瘤Mask/影像，只记录审计并排除，不会使用教师伪标签代替。
+- `--priority-train-patients /dataset/private_cohorts/train.txt`：**优先Train名单**。凡符合人工GT条件的指定患者，必须分到Train，绝不挪入Val/Test。如果指定患者实际缺GT，会报告缺失，不会偷偷替换成其他患者。
+- `--fixed-val-patients /dataset/private_cohorts/fixed_val_patients.txt`：可选，沿用之前的固定Val名单。指定且符合条件的患者固定Val；名单中有缺GT者，就从 `all - Train - 已固定Val` 中随机补足，不动Train。其余符合条件的患者全部Test。**如果不传固定Val名单**，就从 `all - Train` 中按 `--val-fraction` 的总病例比例选Val，其余Test。
+- `all.txt` 必须包含所有Train和固定Val ID，否则程序拒绝构建。Train与Val名单不能重叠。AP和PVP患者划分同步。
+- 用户示例：`all.txt` 有177个不同ID、`train.txt` 有110个不同ID、固定Val 27个且不与Train重叠时，**全部具备人工GT的理想结果**是 **Train=110、Val=27、Test=40**，并非70/15/15。实际结果取决于服务器完整人工GT数量。
+
+**建议先运行不读取NIfTI、不生成PNG的plan：**
+
+```bash
+cd /workspace/realgt-liverdet
+git pull origin main
+python -m pip install -e .
+
+realgt plan \
+  --root /dataset/dataset/gx_all_registered \
+  --out /dataset/realgt_cohort_plan \
+  --all-patients /dataset/private_cohorts/all.txt \
+  --priority-train-patients /dataset/private_cohorts/train.txt \
+  --fixed-val-patients /dataset/private_cohorts/fixed_val_patients.txt \
+  --seed 42
+```
+
+先检查 `/dataset/realgt_cohort_plan/manifests/` 下的 `all_cohort_audit.csv`、`priority_split_audit.csv`、`splits.csv`。这会指出名单中ID缺少目录或完整人工GT的原因。仅确认数据正确后，再创建正式数据集：
+
+```bash
+realgt build \
+  --root /dataset/dataset/gx_all_registered \
+  --out /dataset/realgt_liverdet_priority_train \
+  --all-patients /dataset/private_cohorts/all.txt \
+  --priority-train-patients /dataset/private_cohorts/train.txt \
+  --fixed-val-patients /dataset/private_cohorts/fixed_val_patients.txt \
+  --seed 42
+```
+
+注意：这里使用**新的输出目录**。已有 `/dataset/realgt_liverdet` 中旧split的预处理结果不会被自动重新分配。所有病例名单和划分审计仅留在私有服务器，切勿上传公开GitHub仓库。
+
+---
+
 ## 1. 输入数据和真实标签约束
 
 严格扫描患者目录 `/dataset/dataset/gx_all_registered/<patient_id>/`，**只**读取：

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .dataset import (HU_MIN, HU_MAX, build_splits, export_phase,
+from .dataset import (HU_MIN, HU_MAX, _read_fixed_val_list, build_splits, export_phase,
                       make_qc_preview, prepare, scan_cases)
 
 
@@ -14,17 +14,25 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="realgt", description="Manual-GT-only liver lesion detection")
     sub = p.add_subparsers(dest="action", required=True)
     b = sub.add_parser("build", help="Scan manual masks -> patient splits -> PNG/COCO/YOLO")
-    b.add_argument("--root", default="/dataset/dataset/gx_all_registered")
-    b.add_argument("--out", default="/dataset/realgt_liverdet")
-    b.add_argument("--splits-file", help="Optional complete patient_id,split CSV. Cannot combine with --fixed-val-patients.")
-    b.add_argument("--fixed-val-patients",
-                   help="Private TXT/CSV with one patient_id per line; all eligible IDs forced into Val, "
-                        "ineligible IDs replaced by other manually annotated patients.")
-    b.add_argument("--seed", type=int, default=42)
-    b.add_argument("--train-fraction", type=float, default=.70)
-    b.add_argument("--val-fraction", type=float, default=.15)
-    b.add_argument("--hu-min", type=float, default=HU_MIN)
-    b.add_argument("--hu-max", type=float, default=HU_MAX)
+    plan = sub.add_parser("plan", help="Audit cohort and calculate Train/Val/Test BEFORE expensive NIfTI processing")
+    for current in (b, plan):
+        current.add_argument("--root", default="/dataset/dataset/gx_all_registered")
+        current.add_argument("--out", default="/dataset/realgt_liverdet")
+        current.add_argument("--splits-file", help="Optional complete patient_id,split CSV. Cannot combine with --fixed-val-patients.")
+        current.add_argument("--fixed-val-patients",
+                       help="Private TXT/CSV with Val patient_id lines; eligible IDs fixed to Val, "
+                            "missing manual-GT IDs replaced from other non-Train patients.")
+        current.add_argument("--all-patients",
+                       help="Private TXT/CSV of entire allowed manual tumor GT patient cohort. "
+                            "Patients not listed are never included.")
+        current.add_argument("--priority-train-patients",
+                       help="Private TXT/CSV of priority Train IDs. Always in Train if eligible; "
+                            "only remaining allowed patients may enter Val/Test.")
+        current.add_argument("--seed", type=int, default=42)
+        current.add_argument("--train-fraction", type=float, default=.70)
+        current.add_argument("--val-fraction", type=float, default=.15)
+        current.add_argument("--hu-min", type=float, default=HU_MIN)
+        current.add_argument("--hu-max", type=float, default=HU_MAX)
     e = sub.add_parser("export", help="Resume COCO/YOLO exports from existing manifests/slices.csv; no NIfTI reprocessing")
     e.add_argument("--out", required=True, help="Existing realgt build output root")
     e.add_argument("--slices", help="Override slices.csv path (defaults to <out>/manifests/slices.csv)")
@@ -49,14 +57,28 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     a = parser().parse_args(argv)
-    if a.action == "build":
+    if a.action in ("build", "plan"):
         out = Path(a.out)
         out.mkdir(parents=True, exist_ok=True)
-        cases = scan_cases(a.root, out / "manifests" / "cases.csv")
+        if a.priority_train_patients and not a.all_patients:
+            raise ValueError("--priority-train-patients requires --all-patients "
+                             "so the full manual GT cohort is explicitly defined")
+        if a.all_patients:
+            all_ids = set(_read_fixed_val_list(a.all_patients))
+            for label, file in (("priority Train", a.priority_train_patients),
+                                ("fixed Val", a.fixed_val_patients)):
+                if file and not (set(_read_fixed_val_list(file)) <= all_ids):
+                    raise ValueError(f"{label} has patient IDs outside --all-patients")
+        cases = scan_cases(a.root, out / "manifests" / "cases.csv",
+                           allowed_patients=a.all_patients)
         splits = build_splits(cases, out / "manifests" / "splits.csv", seed=a.seed,
                               train_fraction=a.train_fraction, val_fraction=a.val_fraction,
                               external_csv=a.splits_file,
-                              fixed_val_patients=a.fixed_val_patients)
+                              fixed_val_patients=a.fixed_val_patients,
+                              priority_train_patients=a.priority_train_patients)
+        if a.action == "plan":
+            print("Cohort plan written. No NIfTI volumes read or PNG images generated.")
+            return
         frames = prepare(cases, splits, out, hu_min=a.hu_min, hu_max=a.hu_max)
         for phase in ("ap", "pvp"):
             export_phase(frames, out, phase)

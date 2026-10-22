@@ -263,3 +263,139 @@ def test_cli_export_resume_does_not_reload_nifti(tmp_path, monkeypatch):
         assert len(list((base / "images" / "train").glob("*.png"))) > 0
     # Repeated export reuses copies without failure.
     main(["export", "--out", str(out)])
+
+
+def test_prioritized_train_110_fixed_val_27_remaining_test_40(tmp_path):
+    """Private all/train/val lists: train wins before anything is randomized."""
+    patients = [f"G{i:03d}" for i in range(177)]
+    cases = pd.DataFrame([
+        {"patient_id": pid, "phase": phase, "label_source": "manual"}
+        for pid in patients for phase in ("ap", "pvp")
+    ])
+    def write_ids(filename, ids):
+        file = tmp_path / filename
+        file.write_text("\n".join(ids) + "\n")
+        return str(file)
+    train = patients[:110]
+    val = patients[110:137]
+    train_path = write_ids("train.txt", train)
+    val_path = write_ids("val.txt", val)
+    file = tmp_path / "manifests" / "splits.csv"
+    result = build_splits(
+        cases, file, seed=42, train_fraction=.70, val_fraction=.15,
+        priority_train_patients=train_path, fixed_val_patients=val_path
+    )
+    assert result.split.value_counts().to_dict() == {"train": 110, "val": 27, "test": 40}
+    assert set(result.loc[result.split == "train", "patient_id"]) == set(train)
+    assert set(result.loc[result.split == "val", "patient_id"]) == set(val)
+    assert not (set(train) & set(result.loc[result.split != "train", "patient_id"]))
+    assert all(result.groupby("patient_id").split.nunique() == 1)
+    audit = pd.read_csv(file.parent / "priority_split_audit.csv")
+    assert (audit.status == "priority_train_included").sum() == 110
+    assert (audit.status == "fixed_val_included").sum() == 27
+    repeat = build_splits(
+        cases, file.parent / "repeat.csv", seed=42,
+        priority_train_patients=train_path, fixed_val_patients=val_path
+    )
+    pd.testing.assert_frame_equal(result, repeat)
+
+
+def test_priority_train_missing_and_val_missing_never_move_train(tmp_path):
+    ids = [f"P{i:03d}" for i in range(20)]
+    cases = pd.DataFrame([
+        {"patient_id": pid, "phase": phase, "label_source": "manual"}
+        for pid in ids for phase in ("ap", "pvp")
+    ])
+    tr = tmp_path / "train.txt"
+    tr.write_text("\n".join(ids[:10] + ["TRAIN_MISSING"]) + "\n")
+    val = tmp_path / "val.txt"
+    val.write_text("P010\nVAL_MISSING\n")
+    result = build_splits(cases, tmp_path / "manifest" / "splits.csv",
+                          priority_train_patients=str(tr), fixed_val_patients=str(val))
+    assert result.split.value_counts().to_dict() == {"train": 10, "val": 2, "test": 8}
+    assert set(result.loc[result.split == "train", "patient_id"]) == set(ids[:10])
+    audit = pd.read_csv(tmp_path / "manifest" / "priority_split_audit.csv")
+    assert (audit.status == "priority_train_ineligible").sum() == 1
+    assert (audit.status == "fixed_val_ineligible").sum() == 1
+    assert (audit.status == "val_replacement").sum() == 1
+
+
+def test_priority_train_val_overlap_is_rejected(tmp_path):
+    ids = [f"P{i:03d}" for i in range(8)]
+    cases = pd.DataFrame([
+        {"patient_id": pid, "phase": phase, "label_source": "manual"}
+        for pid in ids for phase in ("ap", "pvp")
+    ])
+    tr = tmp_path / "train.txt"
+    tr.write_text("P000\nP001\n")
+    va = tmp_path / "val.txt"
+    va.write_text("P001\nP002\n")
+    with pytest.raises(ValueError, match="both priority Train and fixed Val"):
+        build_splits(cases, tmp_path / "splits.csv",
+                     priority_train_patients=str(tr), fixed_val_patients=str(va))
+
+
+def test_allowed_all_cohort_excludes_unlisted_and_audits_missing(tmp_path):
+    root = _dataset(tmp_path, n=6)
+    all_ids = tmp_path / "all.txt"
+    all_ids.write_text("P000\nP001\nP_MISSING\nP999\n")
+    result = scan_cases(
+        str(root), tmp_path / "manifest" / "cases.csv",
+        allowed_patients=str(all_ids)
+    )
+    assert set(result.patient_id) == {"P000", "P001"}
+    audit = pd.read_csv(tmp_path / "manifest" / "all_cohort_audit.csv")
+    status = dict(zip(audit.patient_id, audit.status))
+    assert status["P000"] == status["P001"] == "eligible_manual_gt"
+    assert status["P_MISSING"] == "missing_patient_directory"
+    assert status["P999"] == "missing_manual_tumor_masks"
+
+
+def test_build_cli_private_all_priority_train_fixed_val(tmp_path):
+    root = _dataset(tmp_path, n=9)
+    filenames = []
+    for name, values in [
+        ("all.txt", [f"P{i:03d}" for i in range(9)]),
+        ("train.txt", ["P000", "P001", "P002", "P003"]),
+        ("val.txt", ["P004", "P005"]),
+    ]:
+        fn = tmp_path / name
+        fn.write_text("\n".join(values) + "\n")
+        filenames.append(fn)
+    out = tmp_path / "final"
+    main([
+        "build", "--root", str(root), "--out", str(out),
+        "--all-patients", str(filenames[0]),
+        "--priority-train-patients", str(filenames[1]),
+        "--fixed-val-patients", str(filenames[2]),
+        "--seed", "42",
+    ])
+    splits = pd.read_csv(out / "manifests" / "splits.csv")
+    assert splits.split.value_counts().to_dict() == {"train": 4, "test": 3, "val": 2}
+    assert set(splits.loc[splits.split == "train", "patient_id"]) == set(
+        ["P000", "P001", "P002", "P003"]
+    )
+    assert (out / "manifests" / "all_cohort_audit.csv").exists()
+    assert (out / "manifests" / "priority_split_audit.csv").exists()
+
+
+def test_cohort_plan_only_no_volume_processing(tmp_path, monkeypatch):
+    root = _dataset(tmp_path, n=9)
+    def write_ids(name, values):
+        p = tmp_path / name
+        p.write_text("\n".join(values) + "\n")
+        return str(p)
+    all_path = write_ids("all.txt", [f"P{i:03d}" for i in range(9)])
+    train_path = write_ids("train.txt", [f"P{i:03d}" for i in range(4)])
+    val_path = write_ids("val.txt", ["P004", "P005"])
+    monkeypatch.setattr("realgt.dataset.nib.load",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("NIfTI should not be read")))
+    dest = tmp_path / "plan"
+    main(["plan", "--root", str(root), "--out", str(dest),
+          "--all-patients", all_path, "--priority-train-patients", train_path,
+          "--fixed-val-patients", val_path])
+    assert (dest / "manifests" / "splits.csv").is_file()
+    assert not (dest / "manifests" / "slices.csv").exists()
+    assert not (dest / "data").exists()
+    splits = pd.read_csv(dest / "manifests" / "splits.csv")
+    assert splits.split.value_counts().to_dict() == {"train": 4, "val": 2, "test": 3}
